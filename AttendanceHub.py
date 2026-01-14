@@ -483,19 +483,31 @@ def build_whatsapp_message_for_trainee(
     d_to: date,
     period_label: str,
 ) -> tuple[str, list[str]]:
+    """
+    ✅ FIX:
+    - Details (list of absences) stays limited to the selected period.
+    - BUT 10% computation (remaining / exceeded) is cumulative across ALL TIME.
+    """
+
     trainee_id = tr_row["id"]
     df_abs_t = df_abs_all[df_abs_all["trainee_id"] == trainee_id].copy()
 
     if df_abs_t.empty:
         return "", ["لا توجد غيابات لهذا المتكوّن في أي فترة."]
 
+    # --- parse dates ---
     df_abs_t["date_dt"] = pd.to_datetime(df_abs_t["date"], errors="coerce")
+
+    # =========================
+    # (1) Details only for period
+    # =========================
     mask_period = (df_abs_t["date_dt"].dt.date >= d_from) & (df_abs_t["date_dt"].dt.date <= d_to)
     df_abs_period = df_abs_t[mask_period].copy()
 
     if df_abs_period.empty:
         return "", ["لا توجد غيابات في هذه الفترة."]
 
+    # attach subject info for period details
     df_abs_period = df_abs_period.merge(
         df_sub_all[["id", "nom_matiere", "heures_totales"]],
         left_on="subject_id",
@@ -512,35 +524,57 @@ def build_whatsapp_message_for_trainee(
         just = "مبرر" if str(r.get("justifie", "")).strip() == "Oui" else "غير مبرر"
         detail_lines.append(f"- {dstr} | {subj} | {h:.2f} ساعة ({just})")
 
-    df_eff_t = df_abs_period[df_abs_period["justifie"] != "Oui"].copy()
-    df_eff_t["heures_absence_f"] = df_eff_t["heures_absence"].apply(as_float)
-    df_eff_t["heures_totales_f"] = df_eff_t["heures_totales"].apply(as_float)
+    # =========================
+    # (2) 10% cumulative (ALL TIME)
+    # =========================
+    df_abs_alltime = df_abs_t.copy()
+
+    df_abs_alltime = df_abs_alltime.merge(
+        df_sub_all[["id", "nom_matiere", "heures_totales"]],
+        left_on="subject_id",
+        right_on="id",
+        how="left",
+        suffixes=("", "_sub"),
+    )
+
+    df_eff_all = df_abs_alltime[df_abs_alltime["justifie"] != "Oui"].copy()
+    df_eff_all["heures_absence_f"] = df_eff_all["heures_absence"].apply(as_float)
+    df_eff_all["heures_totales_f"] = df_eff_all["heures_totales"].apply(as_float)
 
     stats_lines = []
     elim_lines = []
 
-    if not df_eff_t.empty:
-        grp_t = df_eff_t.groupby("nom_matiere", as_index=False).agg(
+    if not df_eff_all.empty:
+        grp_t = df_eff_all.groupby("nom_matiere", as_index=False).agg(
             total_abs=("heures_absence_f", "sum"),
             heures_tot=("heures_totales_f", "first"),
         )
         grp_t["limit_10"] = grp_t["heures_tot"] * 0.10
         grp_t["remaining"] = grp_t["limit_10"] - grp_t["total_abs"]
 
+        # ترتيب: المواد اللي أقرب/فاتت 10% تظهر الأول
+        grp_t = grp_t.sort_values("remaining", ascending=True).reset_index(drop=True)
+
         for _, g in grp_t.iterrows():
             mat_name = str(g["nom_matiere"]).strip()
-            total_abs = g["total_abs"]
-            remaining = g["remaining"]
+            total_abs = float(g["total_abs"] or 0)
+            heures_tot = float(g["heures_tot"] or 0)
+            limit_10 = float(g["limit_10"] or 0)
+            remaining = float(g["remaining"] or 0)
 
             stats_lines.append(
                 f"- {mat_name}:\n"
-                f"   • مجموع الغياب غير المبرر: {total_abs:.2f} ساعة\n"
-                f"   • الباقي قبل الإقصاء (10٪): {remaining:.2f} ساعة من مجموع الساعات الجملية"
+                f"   • مجموع الغياب غير المبرر (إجمالي): {total_abs:.2f} ساعة\n"
+                f"   • حدّ 10٪: {limit_10:.2f} ساعة (من {heures_tot:.2f} ساعة)\n"
+                f"   • الباقي قبل الإقصاء: {max(0.0, remaining):.2f} ساعة"
             )
 
             if remaining <= 0:
-                elim_lines.append(f"- {mat_name}")
+                elim_lines.append(mat_name)
 
+    # =========================
+    # Build message
+    # =========================
     msg_lines = []
     msg_lines.append("السلام عليكم،")
     msg_lines.append("إدارة هيكل التكوين تحب تعلمك بتفاصيل الغيابات اللي تمّ تسجيلها في الفترة المحدّدة:")
@@ -555,21 +589,24 @@ def build_whatsapp_message_for_trainee(
 
     if stats_lines:
         msg_lines.append("")
-        msg_lines.append("📊 ملخّص الغيابات غير المبررة حسب المواد:")
+        msg_lines.append("📊 ملخّص الغيابات غير المبررة حسب المواد (إجمالي منذ بداية التكوين):")
         msg_lines.extend(stats_lines)
 
     if elim_lines:
         msg_lines.append("")
-        msg_lines.append("⚠️ تنبيه: في بعض المواد تمّ تجاوز الحد الأقصى للغيابات ويمكن يترتّب عليه الإقصاء:")
-        msg_lines.extend(elim_lines)
+        msg_lines.append("⚠️ يؤسفني إعلامكم أنّ هذه المادة/المواد سيتم إجراء الإمتحان بشهر أوت وذلك لتجاوزكم الحد الأقصى المسموح به من الغيابات (10٪):")
+        for m in elim_lines:
+            msg_lines.append(f"- {m}")
 
     msg_lines.append("")
     msg_lines.append("🙏 نشكروك على تفهّمك، ومرحبا بيك في الإدارة لأي استفسار.")
 
     msg = "\n".join(msg_lines)
-    info_debug = [f"غيابات في الفترة: {len(df_abs_period)}", f"غيابات غير مبررة محسوبة لــ10٪: {len(df_eff_t)}"]
+    info_debug = [
+        f"غيابات في الفترة: {len(df_abs_period)}",
+        f"غيابات غير مبررة محسوبة لــ10٪ (إجمالي): {len(df_eff_all)}"
+    ]
     return msg, info_debug
-
 
 # ================== Load data ==================
 @st.cache_data(ttl=300)
@@ -1532,3 +1569,4 @@ with tab5:
                 df_notif_b[["تاريخ الإرسال", "المتكوّن", "التخصّص", "الهاتف", "المرسل إليه", "الفترة"]],
                 use_container_width=True,
             )
+
