@@ -982,58 +982,128 @@ with tab3:
                         except Exception as e:
                             st.error(f"خطأ أثناء تسجيل الغياب: {e}")
 
-            # ---- تعديل / حذف غياب واحد ----
-            st.markdown("---")
-            st.markdown("### ✏️ تعديل / 🗑️ حذف غياب مفرد")
+            # ---- تعديل / حذف غياب مفرد (Filtered by Spec + Trainee + Day) ----
+st.markdown("---")
+st.markdown("### ✏️ تعديل / 🗑️ حذف غياب مفرد (حسب الإختصاص + المتكوّن + اليوم)")
 
-            df_abs_all = load_absences()
-            if df_abs_all.empty:
-                st.info("لا توجد غيابات مسجلة بعد.")
+df_abs_all = load_absences()
+if df_abs_all.empty:
+    st.info("لا توجد غيابات مسجلة بعد.")
+else:
+    # ---- 1) اختيار الإختصاص ----
+    specs_edit = sorted([s for s in df_tr_b["specialite"].dropna().unique() if str(s).strip()])
+    spec_edit = st.selectbox("🔧 اختر الإختصاص", ["(الكل)"] + specs_edit, key="abs_edit_spec")
+
+    df_tr_edit = df_tr_b.copy()
+    if spec_edit != "(الكل)":
+        df_tr_edit = df_tr_edit[df_tr_edit["specialite"] == spec_edit].copy()
+
+    if df_tr_edit.empty:
+        st.info("لا يوجد متكوّنون بهذا الإختصاص.")
+    else:
+        # ---- 2) اختيار المتكوّن ----
+        labels_tr_edit = {
+            f"{r['nom']} — {r['specialite']} ({r['telephone']})": r["id"]
+            for _, r in df_tr_edit.iterrows()
+        }
+        tr_label = st.selectbox("👤 اختر المتكوّن", list(labels_tr_edit.keys()), key="abs_edit_tr")
+        trainee_id_edit = labels_tr_edit[tr_label]
+
+        # ---- تجهيز DataFrame مدموج للغيابات (في الفرع الحالي فقط) ----
+        df_abs0 = df_abs_all.copy().rename(columns={"id": "abs_id"})
+        df_abs0["heures_absence_f"] = df_abs0["heures_absence"].apply(as_float)
+
+        df_abs_m = df_abs0.merge(
+            df_tr_all[["id", "nom", "branche", "specialite", "telephone"]],
+            left_on="trainee_id",
+            right_on="id",
+            how="left",
+            suffixes=("", "_tr"),
+        ).merge(
+            df_sub_all[["id", "nom_matiere"]],
+            left_on="subject_id",
+            right_on="id",
+            how="left",
+            suffixes=("", "_sub"),
+        )
+
+        # فلترة الفرع + المتكوّن
+        df_abs_m = df_abs_m[(df_abs_m["branche"] == branch) & (df_abs_m["trainee_id"] == trainee_id_edit)].copy()
+
+        if df_abs_m.empty:
+            st.info("لا توجد غيابات لهذا المتكوّن في هذا الفرع.")
+        else:
+            df_abs_m["date_dt"] = pd.to_datetime(df_abs_m["date"], errors="coerce")
+            df_abs_m = df_abs_m[pd.notna(df_abs_m["date_dt"])].copy()
+
+            if df_abs_m.empty:
+                st.info("لا توجد تواريخ صالحة في الغيابات (تحقق من صيغة التاريخ في الشيت).")
             else:
-                df_abs0 = df_abs_all.copy()
-                df_abs0 = df_abs0.rename(columns={"id": "abs_id"})
-                df_abs0["heures_absence_f"] = df_abs0["heures_absence"].apply(as_float)
+                # ---- 3) Calendar: اختيار اليوم (من الأيام اللي فيها غياب) ----
+                available_days = sorted(df_abs_m["date_dt"].dt.date.unique().tolist())
+                default_day = available_days[-1]  # آخر يوم فيه غياب
 
-                df_abs = df_abs0.merge(
-                    df_tr_all[["id", "nom", "branche", "specialite", "telephone"]],
-                    left_on="trainee_id",
-                    right_on="id",
-                    how="left",
-                    suffixes=("", "_tr"),
-                ).merge(
-                    df_sub_all[["id", "nom_matiere"]],
-                    left_on="subject_id",
-                    right_on="id",
-                    how="left",
-                    suffixes=("", "_sub"),
+                picked_day = st.date_input(
+                    "📅 اختر اليوم",
+                    value=default_day,
+                    min_value=min(available_days),
+                    max_value=max(available_days),
+                    key="abs_edit_day"
                 )
 
-                df_abs = df_abs[df_abs["branche"] == branch].copy()
-                if df_abs.empty:
-                    st.info("لا توجد غيابات في هذا الفرع.")
+                # ---- 4) نعرض غيابات اليوم هذا فقط ----
+                df_day = df_abs_m[df_abs_m["date_dt"].dt.date == picked_day].copy()
+                df_day = df_day.sort_values("nom_matiere").reset_index(drop=True)
+
+                if df_day.empty:
+                    st.info("ما فماش غيابات مسجلة في النهار هذا للمتكوّن المختار.")
                 else:
-                    df_abs["date_dt"] = pd.to_datetime(df_abs["date"], errors="coerce")
-                    df_abs = df_abs.sort_values("date_dt", ascending=False).reset_index(drop=True)
+                    st.markdown("#### 📌 غيابات اليوم المختار")
+                    st.dataframe(
+                        df_day[["nom", "nom_matiere", "date", "heures_absence_f", "justifie", "commentaire"]]
+                        .rename(columns={
+                            "nom": "المتكوّن",
+                            "nom_matiere": "المادة",
+                            "date": "التاريخ",
+                            "heures_absence_f": "ساعات الغياب",
+                            "justifie": "مبرر؟",
+                            "commentaire": "ملاحظة",
+                        }),
+                        use_container_width=True,
+                    )
 
-                    options_abs_edit = [
-                        f"[{i}] {r['nom']} — {r['nom_matiere']} — {r['date']} — {r['heures_absence_f']}h — مبرر: {r['justifie']}"
-                        for i, (_, r) in enumerate(df_abs.iterrows())
+                    # ---- اختيار غياب من غيابات نفس اليوم (لو كان أكثر من مادة) ----
+                    options_abs = [
+                        f"[{i}] {r['nom_matiere']} — {float(r['heures_absence_f']):.2f}h — مبرر: {r['justifie']}"
+                        for i, (_, r) in enumerate(df_day.iterrows())
                     ]
-                    pick_abs = st.selectbox("اختر الغياب للتعديل / الحذف", options_abs_edit, key="abs_edit_pick")
-
+                    pick_abs = st.selectbox("اختر الغياب للتعديل/الحذف", options_abs, key="abs_edit_pick_day")
                     idx_abs = int(pick_abs.split("]")[0].replace("[", "").strip())
-                    row_a = df_abs.iloc[idx_abs]
+                    row_a = df_day.iloc[idx_abs]
 
-                    with st.form("edit_abs_form"):
+                    # ---- فورم التعديل/الحذف ----
+                    with st.form("edit_abs_form_day"):
                         c1, c2, c3 = st.columns(3)
                         with c1:
-                            base_date = row_a["date_dt"].date() if pd.notna(row_a["date_dt"]) else date.today()
-                            new_date = st.date_input("تاريخ الغياب", value=base_date, key="abs_edit_date")
+                            # التاريخ هنا يبقى نفس اليوم افتراضيًا، وتنجم تبدلو لو تحب
+                            base_date = row_a["date_dt"].date() if pd.notna(row_a["date_dt"]) else picked_day
+                            new_date = st.date_input("تاريخ الغياب", value=base_date, key="abs_edit_date_day")
                         with c2:
-                            new_hours = st.number_input("ساعات الغياب", value=float(row_a["heures_absence_f"]), step=0.5, key="abs_edit_hours")
+                            new_hours = st.number_input(
+                                "ساعات الغياب",
+                                value=float(row_a["heures_absence_f"]),
+                                step=0.5,
+                                min_value=0.0,
+                                key="abs_edit_hours_day",
+                            )
                         with c3:
-                            new_just = st.selectbox("مبرر؟", ["Non", "Oui"], index=1 if str(row_a["justifie"]).strip() == "Oui" else 0, key="abs_edit_just")
-                        new_comment = st.text_area("ملاحظة", value=str(row_a.get("commentaire", "")), key="abs_edit_comment")
+                            new_just = st.selectbox(
+                                "مبرر؟",
+                                ["Non", "Oui"],
+                                index=1 if str(row_a["justifie"]).strip() == "Oui" else 0,
+                                key="abs_edit_just_day",
+                            )
+                        new_comment = st.text_area("ملاحظة", value=str(row_a.get("commentaire", "")), key="abs_edit_comment_day")
 
                         b1, b2 = st.columns(2)
                         with b1:
@@ -1042,19 +1112,22 @@ with tab3:
                             delete_abs = st.form_submit_button("🗑️ حذف هذا الغياب")
 
                     if submit_edit_abs:
-                        try:
-                            aid = row_a["abs_id"]
-                            updates = {
-                                "date": new_date.strftime("%Y-%m-%d"),
-                                "heures_absence": str(new_hours),
-                                "justifie": new_just,
-                                "commentaire": new_comment.strip(),
-                            }
-                            update_record_fields_by_id(ABSENCES_SHEET, ABSENCES_COLS, aid, updates)
-                            st.success("✅ تم تعديل الغياب.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"خطأ أثناء تعديل الغياب: {e}")
+                        if new_hours <= 0:
+                            st.error("❌ ساعات الغياب لازم تكون > 0.")
+                        else:
+                            try:
+                                aid = row_a["abs_id"]
+                                updates = {
+                                    "date": new_date.strftime("%Y-%m-%d"),
+                                    "heures_absence": str(new_hours),
+                                    "justifie": new_just,
+                                    "commentaire": new_comment.strip(),
+                                }
+                                update_record_fields_by_id(ABSENCES_SHEET, ABSENCES_COLS, aid, updates)
+                                st.success("✅ تم تعديل الغياب.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"خطأ أثناء تعديل الغياب: {e}")
 
                     if delete_abs:
                         try:
@@ -1582,6 +1655,7 @@ with tab5:
                 df_notif_b[["تاريخ الإرسال", "المتكوّن", "التخصّص", "الهاتف", "المرسل إليه", "الفترة"]],
                 use_container_width=True,
             )
+
 
 
 
